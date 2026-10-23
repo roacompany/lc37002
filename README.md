@@ -1,6 +1,6 @@
 # PDF → PPT 변환기
 
-PDF를 PowerPoint(.pptx)로 변환하는 웹사이트입니다. 변환은 모두 브라우저 안에서 이루어지므로 파일이 서버로 업로드되지 않고, 별도 백엔드 없이 정적 호스팅(GitHub Pages 등)만으로 운영할 수 있습니다.
+PDF를 PowerPoint(.pptx)로 변환하는 웹사이트입니다. 변환은 모두 브라우저 안에서 이루어지므로 파일이 서버로 업로드되지 않고, 별도 백엔드 없이 정적 호스팅(Cloudflare Workers 등)만으로 운영할 수 있습니다.
 
 ## 변환 방식
 
@@ -88,8 +88,9 @@ npm run preview  # 빌드 결과 확인
 
 ## 배포
 
-- **Cloudflare Workers**: Cloudflare 대시보드에서 저장소를 연결하고 Build command `npm run build`, Deploy command `npx wrangler deploy`로 설정합니다. 배포 설정은 `wrangler.jsonc`에 있으며 `dist/`를 정적 사이트로 서비스합니다. Worker 이름은 `wrangler.jsonc`의 `name`(`lc37002`)과 같아야 합니다.
-- **GitHub Pages**: `main` 브랜치에 push하면 `.github/workflows/deploy.yml`이 배포합니다. 저장소 **Settings → Pages → Source**를 **GitHub Actions**로 설정해야 하며, 무료 요금제에서는 공개 저장소만 가능합니다.
+Cloudflare Workers로 배포합니다. Cloudflare 대시보드에서 저장소를 연결하고 Build command `npm run build`, Deploy command `npx wrangler deploy`로 설정하면 `main`에 push할 때마다 자동으로 배포됩니다. 배포 설정은 `wrangler.jsonc`에 있으며 `dist/`를 정적 사이트로 서비스합니다. Worker 이름은 `wrangler.jsonc`의 `name`(`lc37002`)과 같아야 합니다.
+
+`dist/`는 정적 파일이라 다른 정적 호스팅에 그대로 올려도 동작합니다.
 
 ## 구조
 
