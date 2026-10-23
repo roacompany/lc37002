@@ -35,5 +35,8 @@
   "type": "module",
   "overrides": {
     "image-size": "^2.0.4"
+  },
+  "engines": {
+    "node": ">=22.12.0"
   }
 }
