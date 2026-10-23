@@ -4,10 +4,12 @@
 import { cpSync, mkdirSync, readdirSync, rmSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { createRequire } from "node:module";
+import { fileURLToPath } from "node:url";
 
 const require = createRequire(import.meta.url);
 const pkgDir = (name) => dirname(require.resolve(`${name}/package.json`));
-const publicDir = join(import.meta.dirname, "..", "public");
+// import.meta.dirname은 Node 20.11+ 전용이라 fileURLToPath로 구한다
+const publicDir = join(dirname(fileURLToPath(import.meta.url)), "..", "public");
 
 const pdfjsTarget = join(publicDir, "pdfjs");
 rmSync(pdfjsTarget, { recursive: true, force: true });
