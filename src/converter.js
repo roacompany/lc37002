@@ -1,6 +1,7 @@
 import * as pdfjsLib from "pdfjs-dist/legacy/build/pdf.mjs";
 import workerUrl from "pdfjs-dist/legacy/build/pdf.worker.min.mjs?url";
 import PptxGenJS from "pptxgenjs";
+import JSZip from "jszip";
 import { resolveFont, measureTextWidth } from "./fonts.js";
 import { createOcrEngine, eraseText } from "./ocr.js";
 import { devicePath, bboxOfPath, extractShapes, addShapes } from "./shapes.js";
@@ -89,7 +90,23 @@ export async function convertPdfToPptx(pdf, options) {
     await ocrEngine?.terminate();
   }
 
-  return pptx.write({ outputType: "blob", compression: true });
+  return compressPptx(await pptx.write({ outputType: "arraybuffer" }));
+}
+
+/**
+ * pptxgenjs는 outputType을 지정하면 compression 옵션을 무시하고 압축 없이 저장한다(지정하지 않으면 오류).
+ * 슬라이드 XML은 압축이 잘 되므로 다시 묶는다. 이미 압축된 그림 파일은 그대로 둔다.
+ */
+async function compressPptx(data) {
+  const zip = await JSZip.loadAsync(data);
+  zip.forEach((path, file) => {
+    if (/\.(jpe?g|png|gif)$/i.test(path)) file.options.compression = "STORE";
+  });
+  return zip.generateAsync({
+    type: "blob",
+    compression: "DEFLATE",
+    mimeType: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+  });
 }
 
 function slideLayoutFor(widthPt, heightPt) {
@@ -171,22 +188,30 @@ async function recognizePage(page, unit, scale, suppress, background, engine) {
   if (source !== background) releaseCanvas(source);
 
   return found.map((l) => {
-    const width = (l.bbox.x1 - l.bbox.x0) / ocrScale;
-    const fontSize = l.fontSize / ocrScale;
+    const font = resolveFont("", {}, "sans-serif", l.words.map((w) => w.text).join(""));
+    // 띄어쓰기로 나뉜 덩어리마다 인식한 영역의 왼쪽·오른쪽 끝을 원본 위치로 삼는다. 띄어쓰기 없이 붙은 단어들은
+    // 한 덩어리로 맞춘다(한글은 음절마다 단어 상자가 나뉘는데 그 위치가 부정확하다). 인식 영역은 잉크의 끝이고
+    // 글자 상자는 그보다 좌우 여백(약 0.05em)만큼 넓으므로 그만큼 넓혀 잡는다.
+    const bearing = (l.fontSize / ocrScale) * 0.05;
+    const chars = [];
+    l.words.forEach((w, i) => {
+      if (i > 0 && w.spaceBefore) chars.push({ ch: " ", font, color: l.words[i - 1].color, alpha: 1 });
+      const starts = i === 0 || w.spaceBefore;
+      const ends = i === l.words.length - 1 || l.words[i + 1].spaceBefore;
+      const letters = [...w.text];
+      letters.forEach((ch, k) => {
+        const c = { ch, font, color: w.color, alpha: 1 };
+        if (starts && k === 0) c.x = w.bbox.x0 / ocrScale - bearing;
+        if (ends && k === letters.length - 1) c.endX = w.bbox.x1 / ocrScale + bearing;
+        chars.push(c);
+      });
+    });
     return {
-      x: l.bbox.x0 / ocrScale,
+      x: chars[0].x,
       y: l.baseline / ocrScale,
-      width,
-      fontSize,
-      items: [
-        {
-          segments: l.runs.map((r) => ({ text: r.text, color: r.color, alpha: 1 })),
-          font: resolveFont("", {}, "sans-serif", l.runs.map((r) => r.text).join("")),
-          width,
-          fontSize,
-          ascent: l.hasCJK ? 0.88 : 0.9,
-        },
-      ],
+      width: (l.bbox.x1 - l.bbox.x0) / ocrScale,
+      fontSize: l.fontSize / ocrScale,
+      chars,
     };
   });
 }
@@ -231,12 +256,14 @@ async function renderPage(page, viewport, { capture = false, suppressText = null
   };
 
   if (capture || suppressText || suppressPaths) {
+    let lastFill = null;
     patch("fillText", function (original, args) {
       const i = glyphIndex++;
+      let glyph = null;
       if (capture) {
         const m = this.getTransform();
         const [, x, y] = args;
-        const glyph = {
+        glyph = {
           index: i,
           x: m.a * x + m.c * y + m.e,
           y: m.b * x + m.d * y + m.f,
@@ -246,7 +273,24 @@ async function renderPage(page, viewport, { capture = false, suppressText = null
         glyphs.push(glyph);
         events.push({ kind: "glyph", index: i, bbox: glyphBox(this, glyph) });
       }
+      lastFill = { index: i, args, style: this.fillStyle, glyph };
       if (suppressText?.has(i)) return;
+      return original.apply(this, args);
+    });
+    // 채우기와 윤곽선을 함께 쓰는 글자(렌더링 모드 2)는 같은 자리에 strokeText를 이어서 부른다. 같은 색이면 굵게 보이려는
+    // 것(가짜 굵게)이므로, 채우기를 텍스트 상자로 옮길 때 윤곽선도 빼고 상자를 굵게 만든다. 다른 색 윤곽선은 이미지에 남긴다.
+    patch("strokeText", function (original, args) {
+      const fill = lastFill;
+      lastFill = null;
+      const same = fill && fill.args[0] === args[0] && fill.args[1] === args[1] && fill.args[2] === args[2] && fill.style === this.strokeStyle;
+      if (same) {
+        // 아주 가는 윤곽선은 굵게로 보지 않는다 (가짜 굵게는 보통 글자 크기의 3% 안팎)
+        const px = parseFloat(/(\d+(?:\.\d+)?)px/.exec(this.font)?.[1] ?? "0");
+        if (fill.glyph && this.lineWidth >= px * 0.015) fill.glyph.bold = true;
+        if (suppressText?.has(fill.index)) return;
+      } else if (capture) {
+        events.push({ kind: "other", bbox: glyphBox(this, devicePoint(this.getTransform(), args[1], args[2])) });
+      }
       return original.apply(this, args);
     });
     for (const kind of ["fill", "stroke"]) {
@@ -268,7 +312,6 @@ async function renderPage(page, viewport, { capture = false, suppressText = null
     patch("fillRect", other((ctx, [x, y, w, h]) => transformRect(ctx.getTransform(), x, y, w, h)));
     patch("strokeRect", other((ctx, [x, y, w, h]) => transformRect(ctx.getTransform(), x, y, w, h)));
     patch("putImageData", other((ctx, [img, x, y]) => ({ x0: x, y0: y, x1: x + img.width, y1: y + img.height })));
-    patch("strokeText", other((ctx, [, x, y]) => glyphBox(ctx, devicePoint(ctx.getTransform(), x, y))));
     patch("save", function (original, args) {
       clipStack.push(clip);
       return original.apply(this, args);
@@ -415,23 +458,22 @@ function buildTextLines(page, textContent, glyphs, unit, scale) {
     });
   }
 
-  // 렌더링된 글자를 텍스트 항목에 배정 (글자 원점이 항목의 기준선 근처에 있는지)
+  // 렌더링된 글자를 텍스트 항목에 배정 (글자 원점이 항목의 기준선 근처에 있는지).
+  // 글자 원점은 항목의 [시작, 끝) 안에 있으므로, 맞붙은 두 항목의 경계에 놓인 글자는 뒤 항목의 첫 글자다.
+  // 범위를 벗어난 거리 → 기준선 거리 → 더 뒤에서 시작한 항목 순으로 고른다.
   for (const g of glyphs) {
     const gx = g.x / scale;
     const gy = g.y / scale;
     let best = null;
-    let bestDist = Infinity;
     for (const it of items) {
-      const tol = it.fontSize * 0.25;
-      if (gx < it.x - tol || gx > it.x + it.width + tol) continue;
+      const eps = it.fontSize * 0.02;
+      const out = Math.max(it.x - eps - gx, gx - (it.x + it.width - eps), 0);
       const dy = Math.abs(gy - it.y);
-      if (dy > it.fontSize * 0.35) continue;
-      if (dy < bestDist) {
-        bestDist = dy;
-        best = it;
-      }
+      if (out > it.fontSize * 0.25 || dy > it.fontSize * 0.35) continue;
+      const cand = { it, out, dy, tol: eps };
+      if (!best || closerGlyphOwner(cand, best)) best = cand;
     }
-    best?.glyphs.push({ ...g, x: gx });
+    best?.it.glyphs.push({ ...g, x: gx });
   }
 
   const styles = textContent.styles;
@@ -446,7 +488,7 @@ function buildTextLines(page, textContent, glyphs, unit, scale) {
     const fontObj = getFontObject(page, it.fontName);
     const style = styles[it.fontName] ?? {};
     it.font = resolveFont(fontObj?.name ?? "", fontObj ?? {}, style.fontFamily, it.str);
-    it.ascent = style.ascent;
+    if (it.glyphs.filter((g) => g.bold).length * 2 > it.glyphs.length) it.font.bold = true;
     it.segments = splitByColor(it);
 
     if (cur && canJoin(cur, it)) {
@@ -464,7 +506,53 @@ function buildTextLines(page, textContent, glyphs, unit, scale) {
     }
     if (it.hasEOL) cur = null;
   }
+  for (const line of lines) line.chars = lineChars(line);
   return lines;
+}
+
+/**
+ * 줄을 글자 목록으로 펼친다. 글자마다 글꼴·색과 함께, 원본에서 그 글자가 시작하는 위치(x, 그려진 글리프의 원점)와
+ * 끝나는 위치(endX, 텍스트 항목의 끝)를 알 수 있으면 붙여 둔다. addTextLine이 이 위치에 맞춰 자간을 정한다.
+ */
+function lineChars(line) {
+  const chars = [];
+  for (const it of line.items) {
+    const glyphs = [...it.glyphs].sort((p, q) => p.x - q.x);
+    const drawn = glyphMapping(it);
+    const start = chars.length;
+    let gi = 0;
+    for (const seg of it.segments) {
+      for (const ch of seg.text) {
+        // 글리프와 짝지을 수 없는 항목은 띄어쓰기에서 나누지 않고 항목 전체를 한 구간으로 맞춘다
+        const c = { ch, font: it.font, color: seg.color, alpha: seg.alpha, whole: !drawn };
+        if (drawn?.(ch) && gi < glyphs.length) c.x = glyphs[gi++].x;
+        chars.push(c);
+      }
+    }
+    chars[start].x ??= it.x;
+    // 덧붙인 띄어쓰기(trailingSpace)는 항목 폭에 들어 있지 않으므로 그 앞 글자에 끝 위치를 단다
+    chars[start + [...it.str].length - 1].endX = it.x + it.width;
+  }
+  return chars;
+}
+
+/**
+ * 텍스트 항목의 글자와 그려진 글리프를 순서대로 짝지을 수 있으면, 그 글자에 글리프가 있는지 알려 주는 함수를 돌려준다.
+ * 띄어쓰기는 보통 그리지 않지만, 내장되지 않은 표준 글꼴처럼 띄어쓰기도 그리는 경우가 있다. 합자 등으로 수가 다르면 null.
+ */
+function glyphMapping(item) {
+  const chars = [...item.str];
+  const visible = chars.filter((ch) => /\S/.test(ch)).length;
+  if (item.glyphs.length === visible) return (ch) => /\S/.test(ch);
+  if (item.glyphs.length === chars.length) return () => true;
+  return null;
+}
+
+function closerGlyphOwner(a, b) {
+  const tol = Math.min(a.tol, b.tol);
+  if (Math.abs(a.out - b.out) > tol) return a.out < b.out;
+  if (Math.abs(a.dy - b.dy) > tol) return a.dy < b.dy;
+  return a.it.x > b.it.x;
 }
 
 /** 한 텍스트 항목 안에서 글자별 색이 다르면 색 구간으로 나눈다. */
@@ -472,9 +560,9 @@ function splitByColor(item) {
   const glyphs = [...item.glyphs].sort((p, q) => p.x - q.x);
   const colorOf = (g) => ({ color: parseColor(g.color), alpha: g.alpha });
   const chars = [...item.str];
-  const visible = chars.filter((ch) => /\S/.test(ch)).length;
+  const drawn = glyphMapping(item);
 
-  if (visible !== glyphs.length) {
+  if (!drawn) {
     // 글자 수와 그려진 글리프 수가 다르면(합자 등) 가장 많이 쓰인 색 하나로 처리
     const counts = new Map();
     for (const g of glyphs) {
@@ -489,7 +577,7 @@ function splitByColor(item) {
   let gi = 0;
   let style = colorOf(glyphs[0]);
   for (const ch of chars) {
-    if (/\S/.test(ch)) style = colorOf(glyphs[gi++]);
+    if (drawn(ch)) style = colorOf(glyphs[gi++]);
     const last = segments.at(-1);
     if (last && last.color === style.color && last.alpha === style.alpha) last.text += ch;
     else if (last && /^\s$/.test(ch)) last.text += ch;
@@ -529,40 +617,37 @@ function parseColor(css) {
   return "000000";
 }
 
+// 줄 간격 100%인 PPTX 텍스트는 글꼴과 상관없이 줄 높이가 글자 크기의 1.2배이고, 첫 줄 기준선은 상자 위쪽에서
+// 글자 크기만큼 아래에 놓인다(LibreOffice에서 글꼴을 바꿔 가며 측정).
+// 원본 PDF 글꼴의 ascent로 상자 위치를 잡으면 글꼴에 따라 글자가 최대 0.3em가량 아래로 밀린다.
+const FIRST_BASELINE_EM = 1.0;
+
 function addTextLine(slide, line, ptToIn, offX, offY) {
   const size = line.fontSize;
-  const first = line.items[0];
-  const ascent = first.ascent && first.ascent > 0.5 && first.ascent < 1.2 ? first.ascent : 0.9;
   const sizePt = round(size * ptToIn * 72, 2);
 
   const runs = [];
-  for (const it of line.items) {
-    // PowerPoint에서 원본과 같은 폭이 되도록 자간 보정 (대체 폰트일 때 줄이 넘치거나 비는 것을 방지)
-    let charSpacing;
-    const text = it.segments.map((s) => s.text).join("");
-    const measured = measureTextWidth(it.trailingSpace ? text.slice(0, -1) : text, it.font, it.fontSize);
-    const count = [...text].length - (it.trailingSpace ? 1 : 0);
-    if (measured && count > 1) {
-      const diff = (it.width - measured) / (count - 1);
-      if (Math.abs(diff) > it.fontSize * 0.01) charSpacing = Math.max(-it.fontSize * 0.3, Math.min(it.fontSize * 0.5, diff));
-    }
-    for (const seg of it.segments) {
-      const options = {
-        fontFace: it.font.family,
-        fontSize: sizePt,
-        bold: it.font.bold,
-        italic: it.font.italic,
-        color: seg.color,
-      };
-      if (charSpacing !== undefined) options.charSpacing = round(charSpacing * ptToIn * 72, 2);
-      if (seg.alpha < 1) options.transparency = Math.round((1 - seg.alpha) * 100);
-      runs.push({ text: seg.text, options });
-    }
+  // PPTX의 자간은 0.01pt 단위라서 그 단위로 반올림한 값으로 위치를 따라간다
+  for (const run of layoutRuns(line.chars, line.x, size, 0.01 / (ptToIn * 72))) {
+    const options = {
+      fontFace: run.font.family,
+      fontSize: sizePt,
+      bold: run.font.bold,
+      italic: run.font.italic,
+      color: run.color,
+    };
+    const spacing = round(run.spacing * ptToIn * 72, 2);
+    if (spacing) options.charSpacing = spacing;
+    if (run.alpha < 1) options.transparency = Math.round((1 - run.alpha) * 100);
+    // 서식과 자간이 같은 이웃 구간은 합친다
+    const last = runs.at(-1);
+    if (last && JSON.stringify(last.options) === JSON.stringify(options)) last.text += run.text;
+    else runs.push({ text: run.text, options });
   }
 
   slide.addText(runs, {
     x: offX + line.x * ptToIn,
-    y: offY + (line.y - size * ascent) * ptToIn,
+    y: offY + (line.y - size * FIRST_BASELINE_EM) * ptToIn,
     w: Math.max(line.width * 1.02, size * 0.5) * ptToIn,
     h: size * 1.25 * ptToIn,
     margin: 0,
@@ -572,6 +657,67 @@ function addTextLine(slide, line, ptToIn, offX, offY) {
     fit: "none",
     lineSpacingMultiple: 1,
   });
+}
+
+/**
+ * 글자 목록을 PowerPoint 구간(run)으로 나누고 구간마다 자간을 정한다.
+ * 대체 글꼴은 글자마다 폭의 비율이 원본과 달라서, 줄 전체에 같은 자간을 주면 줄 끝은 맞아도 가운데 단어들이 밀린다.
+ * 그래서 단어와 띄어쓰기를 따로 구간으로 나누고, 실제로 그려질 위치(pen)를 따라가며 각 단어가 원본 위치에서
+ * 시작하도록 자간을 정한다. PowerPoint와 LibreOffice는 구간의 마지막 글자 뒤에도 자간을 더하므로, 한 구간의 자간으로
+ * 다음 구간의 시작 위치까지 맞출 수 있다. 위치는 모두 pt.
+ */
+function layoutRuns(chars, startX, size, step) {
+  const tokens = [];
+  for (const c of chars) {
+    const kind = c.whole ? "whole" : /\S/.test(c.ch) ? "word" : "space";
+    const last = tokens.at(-1);
+    // 텍스트 항목이 끝나는 곳(endX)에서도 나눠 항목마다 위치를 맞춘다
+    if (last && last.kind === kind && sameStyle(last.chars[0], c) && last.chars.at(-1).endX === undefined) last.chars.push(c);
+    else tokens.push({ kind, chars: [c] });
+  }
+
+  const runs = [];
+  let pen = startX;
+  tokens.forEach((t, i) => {
+    const { font, color, alpha } = t.chars[0];
+    const text = t.chars.map((c) => c.ch).join("");
+    const n = t.chars.length;
+    const width = measureTextWidth(text, font, size);
+    let spacing = 0;
+    if (width !== null) {
+      // 이 구간이 끝나야 할 위치: 바로 이어지는 다음 구간의 시작을 알면 그곳, 아니면 마지막 글자의 끝
+      const end = tokens[i + 1]?.chars[0].x ?? t.chars[n - 1].endX;
+      if (end !== undefined) spacing = (end - pen - width) / n;
+      else {
+        // 끝을 모르면(뒤에 띄어쓰기가 오는 단어) 위치를 아는 마지막 글자를 원본 자리에 맞춘다
+        const k = t.chars.findLastIndex((c) => c.x !== undefined);
+        if (k > 0) spacing = (t.chars[k].x - pen - measureTextWidth(text.slice(0, prefixLength(t.chars, k)), font, size)) / k;
+      }
+      // 글자가 겹치거나 지나치게 벌어지지 않게 제한 (띄어쓰기는 표 칸 사이처럼 넓을 수 있어 위로는 두지 않는다)
+      spacing = t.kind === "space" ? Math.max(spacing, (-width / n) * 0.9) : Math.max(-size * 0.3, Math.min(size, spacing));
+      spacing = Math.round(spacing / step) * step;
+    }
+    pen += (width ?? 0) + n * spacing;
+    runs.push({ text, font, color, alpha, spacing });
+  });
+  return runs;
+}
+
+function sameStyle(a, b) {
+  return (
+    a.font.family === b.font.family &&
+    a.font.bold === b.font.bold &&
+    a.font.italic === b.font.italic &&
+    a.color === b.color &&
+    a.alpha === b.alpha
+  );
+}
+
+/** 글자 k개의 UTF-16 길이 (서로게이트 쌍 글자가 있어도 문자열을 글자 단위로 자르기 위해) */
+function prefixLength(chars, k) {
+  let length = 0;
+  for (let i = 0; i < k; i++) length += chars[i].ch.length;
+  return length;
 }
 
 async function addLinks(page, slide, unit, ptToIn, offX, offY) {

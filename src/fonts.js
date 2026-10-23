@@ -108,10 +108,12 @@ export function resolveFont(rawName, flags = {}, genericFamily = "sans-serif", t
     }
   }
   if (!family && base) {
-    // CamelCase 이름은 공백을 넣어 일반적인 패밀리 이름으로 복원 (SourceSansPro → Source Sans Pro)
+    // CamelCase 이름은 공백을 넣어 일반적인 패밀리 이름으로 복원 (SourceSansPro → Source Sans Pro).
+    // 원래 이름에 공백이 없는 글꼴(NanumSquareRound 등)도 있으므로, 띄운 이름이 없고 붙인 이름이 설치돼 있으면 그것을 쓴다
     const stripped = base.replace(/(PSMT|MT|PS)$/, "").replace(STYLE_TOKENS, "");
     if (stripped && /^[A-Za-z0-9 ]+$/.test(stripped)) {
-      family = stripped.replace(/([a-z])([A-Z])/g, "$1 $2").trim();
+      const spaced = stripped.replace(/([a-z])([A-Z])/g, "$1 $2").trim();
+      family = !isFontAvailable(spaced) && isFontAvailable(stripped) ? stripped : spaced;
     } else if (stripped) {
       family = stripped;
     }
@@ -160,6 +162,8 @@ export function isFontAvailable(family) {
 export function measureTextWidth(text, font, sizePt) {
   if (typeof document === "undefined") return null;
   measureCtx ||= document.createElement("canvas").getContext("2d");
-  measureCtx.font = `${font.italic ? "italic " : ""}${font.bold ? "bold " : ""}100px "${font.family}", "${font.fallback}"`;
+  // 두 글꼴 모두 이 PC에 없으면 브라우저 기본 글꼴(보통 명조 계열)로 재게 되므로 비슷한 일반 글꼴을 마지막에 둔다
+  const generic = font.fallback === "Times New Roman" ? "serif" : font.fallback === "Courier New" ? "monospace" : "sans-serif";
+  measureCtx.font = `${font.italic ? "italic " : ""}${font.bold ? "bold " : ""}100px "${font.family}", "${font.fallback}", ${generic}`;
   return (measureCtx.measureText(text).width * sizePt) / 100;
 }
