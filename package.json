@@ -1,0 +1,35 @@
+{
+  "name": "pdf-to-ppt",
+  "version": "1.0.0",
+  "description": "브라우저에서 PDF를 PowerPoint(PPTX)로 변환하는 웹사이트",
+  "scripts": {
+    "predev": "node scripts/copy-assets.mjs",
+    "dev": "vite",
+    "prebuild": "node scripts/copy-assets.mjs",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/roacompany/lc37002.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/roacompany/lc37002/issues"
+  },
+  "homepage": "https://github.com/roacompany/lc37002#readme",
+  "dependencies": {
+    "@tesseract.js-data/eng": "^1.0.0",
+    "@tesseract.js-data/kor": "^1.0.0",
+    "pdfjs-dist": "^6.4.299",
+    "pptxgenjs": "^4.0.1",
+    "tesseract.js": "^7.0.0"
+  },
+  "devDependencies": {
+    "vite": "^8.3.5"
+  },
+  "private": true,
+  "type": "module"
+}
