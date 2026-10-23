@@ -11,15 +11,15 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/roquesea01/lc37002.git"
+    "url": "git+https://github.com/roacompany/lc37002.git"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "bugs": {
-    "url": "https://github.com/roquesea01/lc37002/issues"
+    "url": "https://github.com/roacompany/lc37002/issues"
   },
-  "homepage": "https://github.com/roquesea01/lc37002#readme",
+  "homepage": "https://github.com/roacompany/lc37002#readme",
   "dependencies": {
     "@tesseract.js-data/eng": "^1.0.0",
     "@tesseract.js-data/kor": "^1.0.0",
