@@ -75,8 +75,9 @@ convertBtn.addEventListener("click", async () => {
       imageFormat: $("format").value,
       pages,
       includeLinks: $("links").checked,
+      ocr: $("ocr").value,
       signal: controller.signal,
-      onProgress: ({ page, done, total }) => updateProgress(done, total, page),
+      onProgress: ({ page, done, total, status }) => updateProgress(done, total, page, status),
     });
     download(blob, currentFile.name.replace(/\.pdf$/i, "") + ".pptx");
     setMessage(`변환 완료 · ${formatSize(blob.size)}`);
@@ -95,9 +96,17 @@ convertBtn.addEventListener("click", async () => {
 
 cancelBtn.addEventListener("click", () => controller?.abort());
 
-function updateProgress(done, total, page) {
+function updateProgress(done, total, page, status) {
   barFill.style.width = `${(done / total) * 100}%`;
-  progressText.textContent = done === total ? `${total}/${total} 페이지 완료 · 파일 만드는 중…` : `${done}/${total} 페이지${page ? ` (현재 ${page}쪽)` : ""}`;
+  if (status) progressText.textContent = `${done}/${total} 페이지 · ${status}`;
+  else progressText.textContent = done === total ? `${total}/${total} 페이지 완료 · 파일 만드는 중…` : `${done}/${total} 페이지${page ? ` (현재 ${page}쪽)` : ""}`;
+}
+
+// OCR은 편집 가능 모드에서만 의미가 있다
+for (const radio of document.querySelectorAll('input[name="mode"]')) {
+  radio.addEventListener("change", () => {
+    $("ocr").disabled = document.querySelector('input[name="mode"]:checked').value !== "editable";
+  });
 }
 
 /** "1-3, 5" 형식을 페이지 번호 배열로. 비어 있으면 null(전체). */

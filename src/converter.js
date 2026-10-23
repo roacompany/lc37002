@@ -2,6 +2,7 @@ import * as pdfjsLib from "pdfjs-dist/legacy/build/pdf.mjs";
 import workerUrl from "pdfjs-dist/legacy/build/pdf.worker.min.mjs?url";
 import PptxGenJS from "pptxgenjs";
 import { resolveFont, measureTextWidth } from "./fonts.js";
+import { createOcrEngine, eraseText } from "./ocr.js";
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = workerUrl;
 
@@ -14,7 +15,8 @@ const ASSET_BASE = new URL(`${import.meta.env.BASE_URL}pdfjs/`, window.location.
  * @property {"png"|"jpeg"} imageFormat
  * @property {number[]|null} pages  변환할 페이지 번호(1부터). null이면 전체
  * @property {boolean} includeLinks  PDF 링크를 슬라이드 하이퍼링크로 옮길지 여부
- * @property {(info: {page: number, done: number, total: number}) => void} [onProgress]
+ * @property {"off"|"auto"|"all"} [ocr]  편집 가능 모드의 OCR: auto는 텍스트가 없는 페이지(스캔)만, all은 모든 페이지의 이미지 속 글자까지
+ * @property {(info: {page: number, done: number, total: number, status?: string}) => void} [onProgress]
  * @property {AbortSignal} [signal]
  */
 
@@ -51,16 +53,38 @@ export async function convertPdfToPptx(pdf, options) {
   if (meta?.info?.Title) pptx.title = meta.info.Title;
   if (meta?.info?.Author) pptx.author = meta.info.Author;
 
+  const ocrMode = mode === "editable" ? (options.ocr ?? "off") : "off";
+  let ocrEngine = null;
   let done = 0;
-  for (const pageNumber of pageNumbers) {
-    if (signal?.aborted) throw new DOMException("변환이 취소되었습니다.", "AbortError");
-    onProgress?.({ page: pageNumber, done, total: pageNumbers.length });
-    const page = await pdf.getPage(pageNumber);
-    const slide = pptx.addSlide();
-    await convertPage(page, slide, layout, { mode, scale, imageFormat, includeLinks: options.includeLinks });
-    page.cleanup();
-    done++;
-    onProgress?.({ page: pageNumber, done, total: pageNumbers.length });
+  const total = pageNumbers.length;
+  try {
+    for (const pageNumber of pageNumbers) {
+      if (signal?.aborted) throw new DOMException("변환이 취소되었습니다.", "AbortError");
+      onProgress?.({ page: pageNumber, done, total });
+      const page = await pdf.getPage(pageNumber);
+      const slide = pptx.addSlide();
+      const ocr =
+        ocrMode === "off"
+          ? null
+          : {
+              mode: ocrMode,
+              // OCR 엔진은 처음 필요할 때 한 번만 불러온다
+              getEngine: async () => {
+                if (!ocrEngine) {
+                  onProgress?.({ page: pageNumber, done, total, status: "OCR 엔진과 언어 데이터 불러오는 중…" });
+                  ocrEngine = await createOcrEngine(["kor", "eng"]);
+                }
+                onProgress?.({ page: pageNumber, done, total, status: `${pageNumber}쪽 글자 인식(OCR) 중…` });
+                return ocrEngine;
+              },
+            };
+      await convertPage(page, slide, layout, { mode, scale, imageFormat, includeLinks: options.includeLinks, ocr });
+      page.cleanup();
+      done++;
+      onProgress?.({ page: pageNumber, done, total });
+    }
+  } finally {
+    await ocrEngine?.terminate();
   }
 
   return pptx.write({ outputType: "blob", compression: true });
@@ -82,7 +106,7 @@ function slideLayoutFor(widthPt, heightPt) {
   return { width: w, height: h };
 }
 
-async function convertPage(page, slide, layout, { mode, scale, imageFormat, includeLinks }) {
+async function convertPage(page, slide, layout, { mode, scale, imageFormat, includeLinks, ocr }) {
   const unit = page.getViewport({ scale: 1 });
   // 페이지 크기가 첫 페이지와 다르면 비율을 유지하며 슬라이드 중앙에 맞춘다
   const fit = Math.min(layout.width / (unit.width / 72), layout.height / (unit.height / 72));
@@ -109,13 +133,53 @@ async function convertPage(page, slide, layout, { mode, scale, imageFormat, incl
     const suppress = new Set();
     for (const line of lines) for (const item of line.items) for (const g of item.glyphs) suppress.add(g.index);
     const pass2 = await renderPage(page, viewport, { suppress });
+
+    // 3단계(OCR): 남은 배경 이미지 속 글자를 인식해 텍스트로 바꾸고, 그 자리는 배경색으로 지운다
+    let ocrLines = [];
+    if (ocr && (ocr.mode === "all" || lines.length === 0)) {
+      ocrLines = await recognizePage(page, unit, scale, suppress, pass2.canvas, await ocr.getEngine());
+    }
+
     slide.addImage({ data: canvasToDataUrl(pass2.canvas, imageFormat), ...box });
     releaseCanvas(pass2.canvas);
 
-    for (const line of lines) addTextLine(slide, line, ptToIn, offX, offY);
+    for (const line of [...lines, ...ocrLines]) addTextLine(slide, line, ptToIn, offX, offY);
   }
 
   if (includeLinks) await addLinks(page, slide, unit, ptToIn, offX, offY);
+}
+
+// OCR은 300dpi 근처에서 가장 정확하다. 너무 큰 페이지는 메모리 때문에 긴 변을 제한한다.
+const OCR_DPI = 300;
+const OCR_MAX_SIDE = 5000;
+
+async function recognizePage(page, unit, scale, suppress, background, engine) {
+  const ocrScale = Math.min(OCR_DPI / 72, OCR_MAX_SIDE / Math.max(unit.width, unit.height));
+  // 배경과 같은 배율이면 그대로 쓰고, 아니면 OCR용 해상도로 다시 그린다(편집 가능한 텍스트는 제외)
+  const source = Math.abs(ocrScale - scale) < 0.01 ? background : (await renderPage(page, page.getViewport({ scale: ocrScale }), { suppress })).canvas;
+  const found = await engine.recognize(source, ocrScale * 72);
+  eraseText(background, found, scale / ocrScale);
+  if (source !== background) releaseCanvas(source);
+
+  return found.map((l) => {
+    const width = (l.bbox.x1 - l.bbox.x0) / ocrScale;
+    const fontSize = l.fontSize / ocrScale;
+    return {
+      x: l.bbox.x0 / ocrScale,
+      y: l.baseline / ocrScale,
+      width,
+      fontSize,
+      items: [
+        {
+          segments: l.runs.map((r) => ({ text: r.text, color: r.color, alpha: 1 })),
+          font: resolveFont("", {}, "sans-serif", l.runs.map((r) => r.text).join("")),
+          width,
+          fontSize,
+          ascent: l.hasCJK ? 0.88 : 0.9,
+        },
+      ],
+    };
+  });
 }
 
 function canvasToDataUrl(canvas, format) {
