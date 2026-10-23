@@ -73,7 +73,8 @@ npm run preview  # 빌드 결과 확인
 
 ## 배포
 
-`main` 브랜치에 push하면 `.github/workflows/deploy.yml`이 GitHub Pages에 배포합니다. 저장소 **Settings → Pages → Source**를 **GitHub Actions**로 설정해야 합니다.
+- **Cloudflare Workers**: Cloudflare 대시보드에서 저장소를 연결하고 Build command `npm run build`, Deploy command `npx wrangler deploy`로 설정합니다. 배포 설정은 `wrangler.jsonc`에 있으며 `dist/`를 정적 사이트로 서비스합니다. Worker 이름은 `wrangler.jsonc`의 `name`(`lc37002`)과 같아야 합니다.
+- **GitHub Pages**: `main` 브랜치에 push하면 `.github/workflows/deploy.yml`이 배포합니다. 저장소 **Settings → Pages → Source**를 **GitHub Actions**로 설정해야 하며, 무료 요금제에서는 공개 저장소만 가능합니다.
 
 ## 구조
 
