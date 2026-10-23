@@ -76,6 +76,7 @@ convertBtn.addEventListener("click", async () => {
       pages,
       includeLinks: $("links").checked,
       ocr: $("ocr").value,
+      shapes: $("shapes").checked,
       signal: controller.signal,
       onProgress: ({ page, done, total, status }) => updateProgress(done, total, page, status),
     });
@@ -102,10 +103,12 @@ function updateProgress(done, total, page, status) {
   else progressText.textContent = done === total ? `${total}/${total} 페이지 완료 · 파일 만드는 중…` : `${done}/${total} 페이지${page ? ` (현재 ${page}쪽)` : ""}`;
 }
 
-// OCR은 편집 가능 모드에서만 의미가 있다
+// OCR과 도형 변환은 편집 가능 모드에서만 의미가 있다
 for (const radio of document.querySelectorAll('input[name="mode"]')) {
   radio.addEventListener("change", () => {
-    $("ocr").disabled = document.querySelector('input[name="mode"]:checked').value !== "editable";
+    const editable = document.querySelector('input[name="mode"]:checked').value === "editable";
+    $("ocr").disabled = !editable;
+    $("shapes").disabled = !editable;
   });
 }
 

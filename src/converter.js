@@ -3,6 +3,7 @@ import workerUrl from "pdfjs-dist/legacy/build/pdf.worker.min.mjs?url";
 import PptxGenJS from "pptxgenjs";
 import { resolveFont, measureTextWidth } from "./fonts.js";
 import { createOcrEngine, eraseText } from "./ocr.js";
+import { devicePath, bboxOfPath, extractShapes, addShapes } from "./shapes.js";
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = workerUrl;
 
@@ -15,6 +16,7 @@ const ASSET_BASE = new URL(`${import.meta.env.BASE_URL}pdfjs/`, window.location.
  * @property {"png"|"jpeg"} imageFormat
  * @property {number[]|null} pages  변환할 페이지 번호(1부터). null이면 전체
  * @property {boolean} includeLinks  PDF 링크를 슬라이드 하이퍼링크로 옮길지 여부
+ * @property {boolean} [shapes]  편집 가능 모드에서 단순한 벡터 도형을 PowerPoint 도형으로 바꿀지 여부
  * @property {"off"|"auto"|"all"} [ocr]  편집 가능 모드의 OCR: auto는 텍스트가 없는 페이지(스캔)만, all은 모든 페이지의 이미지 속 글자까지
  * @property {(info: {page: number, done: number, total: number, status?: string}) => void} [onProgress]
  * @property {AbortSignal} [signal]
@@ -78,7 +80,7 @@ export async function convertPdfToPptx(pdf, options) {
                 return ocrEngine;
               },
             };
-      await convertPage(page, slide, layout, { mode, scale, imageFormat, includeLinks: options.includeLinks, ocr });
+      await convertPage(page, slide, layout, { mode, scale, imageFormat, includeLinks: options.includeLinks, shapes: options.shapes ?? true, ocr });
       page.cleanup();
       done++;
       onProgress?.({ page: pageNumber, done, total });
@@ -106,7 +108,7 @@ function slideLayoutFor(widthPt, heightPt) {
   return { width: w, height: h };
 }
 
-async function convertPage(page, slide, layout, { mode, scale, imageFormat, includeLinks, ocr }) {
+async function convertPage(page, slide, layout, { mode, scale, imageFormat, includeLinks, shapes: convertShapes, ocr }) {
   const unit = page.getViewport({ scale: 1 });
   // 페이지 크기가 첫 페이지와 다르면 비율을 유지하며 슬라이드 중앙에 맞춘다
   const fit = Math.min(layout.width / (unit.width / 72), layout.height / (unit.height / 72));
@@ -122,17 +124,23 @@ async function convertPage(page, slide, layout, { mode, scale, imageFormat, incl
     slide.addImage({ data: canvasToDataUrl(canvas, imageFormat), ...box });
     releaseCanvas(canvas);
   } else {
-    // 1단계: 페이지를 그리면서 각 글자가 어디에, 어떤 색으로 그려지는지 기록
+    // 1단계: 페이지를 그리면서 각 글자·도형·이미지가 어디에, 어떤 순서와 색으로 그려지는지 기록
     const pass1 = await renderPage(page, viewport, { capture: true });
+    const canvasSize = { width: pass1.canvas.width, height: pass1.canvas.height };
     releaseCanvas(pass1.canvas);
 
     const textContent = await page.getTextContent({ disableNormalization: false });
     const lines = buildTextLines(page, textContent, pass1.glyphs, unit, scale);
+    const suppressText = new Set();
+    for (const line of lines) for (const item of line.items) for (const g of item.glyphs) suppressText.add(g.index);
 
-    // 2단계: 편집 가능한 텍스트로 옮길 글자만 빼고 다시 그려 배경 이미지를 만든다
-    const suppress = new Set();
-    for (const line of lines) for (const item of line.items) for (const g of item.glyphs) suppress.add(g.index);
-    const pass2 = await renderPage(page, viewport, { suppress });
+    const { shapes, suppress: suppressPaths } = convertShapes
+      ? extractShapes(pass1.events, suppressText, canvasSize, scale)
+      : { shapes: [], suppress: new Set() };
+
+    // 2단계: 텍스트 상자·도형으로 옮긴 것만 빼고 다시 그려 배경 이미지를 만든다
+    const suppress = { suppressText, suppressPaths };
+    const pass2 = await renderPage(page, viewport, suppress);
 
     // 3단계(OCR): 남은 배경 이미지 속 글자를 인식해 텍스트로 바꾸고, 그 자리는 배경색으로 지운다
     let ocrLines = [];
@@ -143,6 +151,7 @@ async function convertPage(page, slide, layout, { mode, scale, imageFormat, incl
     slide.addImage({ data: canvasToDataUrl(pass2.canvas, imageFormat), ...box });
     releaseCanvas(pass2.canvas);
 
+    addShapes(slide, shapes, ptToIn, offX, offY);
     for (const line of [...lines, ...ocrLines]) addTextLine(slide, line, ptToIn, offX, offY);
   }
 
@@ -156,7 +165,7 @@ const OCR_MAX_SIDE = 5000;
 async function recognizePage(page, unit, scale, suppress, background, engine) {
   const ocrScale = Math.min(OCR_DPI / 72, OCR_MAX_SIDE / Math.max(unit.width, unit.height));
   // 배경과 같은 배율이면 그대로 쓰고, 아니면 OCR용 해상도로 다시 그린다(편집 가능한 텍스트는 제외)
-  const source = Math.abs(ocrScale - scale) < 0.01 ? background : (await renderPage(page, page.getViewport({ scale: ocrScale }), { suppress })).canvas;
+  const source = Math.abs(ocrScale - scale) < 0.01 ? background : (await renderPage(page, page.getViewport({ scale: ocrScale }), suppress)).canvas;
   const found = await engine.recognize(source, ocrScale * 72);
   eraseText(background, found, scale / ocrScale);
   if (source !== background) releaseCanvas(source);
@@ -193,36 +202,85 @@ function releaseCanvas(canvas) {
 
 /**
  * 페이지를 캔버스에 렌더링한다.
- * capture: 대상 캔버스에 그려지는 fillText 호출(글자)을 순서대로 기록
- * suppress: 해당 순번의 fillText 호출을 건너뜀 (텍스트 없는 배경 만들기)
+ * capture: 대상 캔버스에 그려지는 글자(fillText)·경로(fill/stroke)·이미지 등을 그리는 순서대로 기록
+ * suppressText / suppressPaths: 해당 순번의 fillText / fill·stroke 호출을 건너뜀 (편집 가능한 요소를 뺀 배경 만들기)
  */
-async function renderPage(page, viewport, { capture = false, suppress = null } = {}) {
+async function renderPage(page, viewport, { capture = false, suppressText = null, suppressPaths = null } = {}) {
   const canvas = document.createElement("canvas");
   canvas.width = Math.ceil(viewport.width);
   canvas.height = Math.ceil(viewport.height);
+  const full = { x0: 0, y0: 0, x1: canvas.width, y1: canvas.height };
 
   const glyphs = [];
+  const events = [];
   const proto = CanvasRenderingContext2D.prototype;
-  const originalFillText = proto.fillText;
-  let index = 0;
+  const originals = new Map();
+  let glyphIndex = 0;
+  let pathIndex = 0;
+  const clipStack = [];
+  let clip = null;
 
-  if (capture || suppress) {
-    proto.fillText = function (text, x, y, maxWidth) {
-      if (this.canvas !== canvas) return originalFillText.apply(this, arguments);
-      const i = index++;
+  // pdf.js가 그룹·마스크용으로 쓰는 임시 캔버스는 건드리지 않고, 결과 캔버스에 그리는 호출만 가로챈다
+  const patch = (name, fn) => {
+    const original = proto[name];
+    originals.set(name, original);
+    proto[name] = function (...args) {
+      if (this.canvas !== canvas) return original.apply(this, args);
+      return fn.call(this, original, args);
+    };
+  };
+
+  if (capture || suppressText || suppressPaths) {
+    patch("fillText", function (original, args) {
+      const i = glyphIndex++;
       if (capture) {
         const m = this.getTransform();
-        glyphs.push({
+        const [, x, y] = args;
+        const glyph = {
           index: i,
           x: m.a * x + m.c * y + m.e,
           y: m.b * x + m.d * y + m.f,
           color: typeof this.fillStyle === "string" ? this.fillStyle : null,
           alpha: this.globalAlpha,
-        });
+        };
+        glyphs.push(glyph);
+        events.push({ kind: "glyph", index: i, bbox: glyphBox(this, glyph) });
       }
-      if (suppress?.has(i)) return;
-      return originalFillText.apply(this, arguments);
-    };
+      if (suppressText?.has(i)) return;
+      return original.apply(this, args);
+    });
+    for (const kind of ["fill", "stroke"]) {
+      patch(kind, function (original, args) {
+        const i = pathIndex++;
+        if (capture) events.push(pathEvent(this, args, kind, i, clip, full));
+        if (suppressPaths?.has(i)) return;
+        return original.apply(this, args);
+      });
+    }
+  }
+  if (capture) {
+    const other = (bboxOf) =>
+      function (original, args) {
+        events.push({ kind: "other", bbox: bboxOf(this, args) ?? full });
+        return original.apply(this, args);
+      };
+    patch("drawImage", other(imageBox));
+    patch("fillRect", other((ctx, [x, y, w, h]) => transformRect(ctx.getTransform(), x, y, w, h)));
+    patch("strokeRect", other((ctx, [x, y, w, h]) => transformRect(ctx.getTransform(), x, y, w, h)));
+    patch("putImageData", other((ctx, [img, x, y]) => ({ x0: x, y0: y, x1: x + img.width, y1: y + img.height })));
+    patch("strokeText", other((ctx, [, x, y]) => glyphBox(ctx, devicePoint(ctx.getTransform(), x, y))));
+    patch("save", function (original, args) {
+      clipStack.push(clip);
+      return original.apply(this, args);
+    });
+    patch("restore", function (original, args) {
+      if (clipStack.length) clip = clipStack.pop();
+      return original.apply(this, args);
+    });
+    patch("clip", function (original, args) {
+      clip = intersectClip(clip, clipRegion(this, args, full));
+      return original.apply(this, args);
+    });
   }
 
   try {
@@ -233,9 +291,101 @@ async function renderPage(page, viewport, { capture = false, suppress = null } =
       background: "rgb(255,255,255)",
     }).promise;
   } finally {
-    proto.fillText = originalFillText;
+    for (const [name, original] of originals) proto[name] = original;
   }
-  return { canvas, glyphs };
+  return { canvas, glyphs, events };
+}
+
+function devicePoint(m, x, y) {
+  return { x: m.a * x + m.c * y + m.e, y: m.b * x + m.d * y + m.f };
+}
+
+function transformRect(m, x, y, w, h) {
+  const pts = [devicePoint(m, x, y), devicePoint(m, x + w, y), devicePoint(m, x, y + h), devicePoint(m, x + w, y + h)];
+  return {
+    x0: Math.min(...pts.map((p) => p.x)),
+    y0: Math.min(...pts.map((p) => p.y)),
+    x1: Math.max(...pts.map((p) => p.x)),
+    y1: Math.max(...pts.map((p) => p.y)),
+  };
+}
+
+function matrixScale(m) {
+  return Math.sqrt(Math.abs(m.a * m.d - m.b * m.c));
+}
+
+/** 글자가 차지하는 대략적인 영역 (겹침 판단용) */
+function glyphBox(ctx, origin) {
+  const px = parseFloat(/(\d+(?:\.\d+)?)px/.exec(ctx.font)?.[1] ?? "10") * matrixScale(ctx.getTransform());
+  return { x0: origin.x - px * 0.2, y0: origin.y - px, x1: origin.x + px, y1: origin.y + px * 0.3 };
+}
+
+function imageBox(ctx, args) {
+  const [img] = args;
+  let rect;
+  if (args.length >= 9) rect = args.slice(5, 9);
+  else if (args.length >= 5) rect = args.slice(1, 5);
+  else rect = [args[1], args[2], img.width ?? img.videoWidth ?? 0, img.height ?? img.videoHeight ?? 0];
+  return transformRect(ctx.getTransform(), ...rect);
+}
+
+function pathEvent(ctx, args, kind, index, clip, full) {
+  const path = args[0] instanceof Path2D ? args[0] : null;
+  const m = ctx.getTransform();
+  const cmds = path ? devicePath(path, m) : null;
+  const style = kind === "fill" ? ctx.fillStyle : ctx.strokeStyle;
+  const color = typeof style === "string" ? parseCssColor(style) : null;
+  // 그라데이션·패턴·혼합 모드·필터가 들어간 것은 도형으로 재현할 수 없어 이미지로 남긴다
+  const plain = color && ctx.globalCompositeOperation === "source-over" && (!ctx.filter || ctx.filter === "none");
+  const ev = {
+    kind: "path",
+    index,
+    indices: [index],
+    pathRef: path,
+    cmds,
+    bbox: cmds ? bboxOfPath(cmds) : full,
+    clip,
+    supported: !!(cmds && plain),
+    fill: null,
+    stroke: null,
+  };
+  const paint = color ? { color: color.hex, alpha: ctx.globalAlpha * color.alpha } : null;
+  if (kind === "fill") ev.fill = paint;
+  else {
+    const s = matrixScale(m);
+    ev.stroke = { ...paint, width: ctx.lineWidth * s, dash: ctx.getLineDash().map((d) => d * s) };
+  }
+  return ev;
+}
+
+function clipRegion(ctx, args, full) {
+  const path = args[0] instanceof Path2D ? args[0] : null;
+  const cmds = path ? devicePath(path, ctx.getTransform()) : null;
+  if (!cmds) return { bbox: full, rect: false };
+  const bbox = bboxOfPath(cmds);
+  const corners = cmds.filter((c) => c[0] !== "Z");
+  const rect =
+    corners.length <= 5 &&
+    corners.every((c) => c[0] !== "C" && c[0] !== "Q") &&
+    corners.every((c) => (Math.abs(c[1] - bbox.x0) < 0.5 || Math.abs(c[1] - bbox.x1) < 0.5) && (Math.abs(c[2] - bbox.y0) < 0.5 || Math.abs(c[2] - bbox.y1) < 0.5));
+  return { bbox, rect };
+}
+
+function intersectClip(a, b) {
+  if (!a) return b;
+  return {
+    bbox: { x0: Math.max(a.bbox.x0, b.bbox.x0), y0: Math.max(a.bbox.y0, b.bbox.y0), x1: Math.min(a.bbox.x1, b.bbox.x1), y1: Math.min(a.bbox.y1, b.bbox.y1) },
+    rect: a.rect && b.rect,
+  };
+}
+
+/** 캔버스 색 문자열("#rrggbb" 또는 "rgba(r, g, b, a)")을 PowerPoint 색과 투명도로 */
+function parseCssColor(css) {
+  if (css.startsWith("#")) return { hex: parseColor(css), alpha: 1 };
+  const m = css.match(/rgba?\(([^)]+)\)/);
+  if (!m) return null;
+  const parts = m[1].split(",").map((v) => parseFloat(v));
+  return { hex: parseColor(css), alpha: parts.length > 3 ? parts[3] : 1 };
 }
 
 /**
